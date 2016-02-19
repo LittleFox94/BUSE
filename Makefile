@@ -1,11 +1,11 @@
-TARGET		:= busexmp loopback
+TARGET		:= busexmp loopback abad1dea
 LIBOBJS 	:= buse.o
 OBJS		:= $(TARGET:=.o) $(LIBOBJS)
 STATIC_LIB	:= libbuse.a
 
 CC		:= /usr/bin/gcc
-CFLAGS		:= -g -pedantic -Wall -Wextra -std=c99
-LDFLAGS		:= -L. -lbuse
+CFLAGS		:= -pedantic -Wall -Wextra -std=gnu99 -O3
+LDFLAGS		:= -L. -lbuse -lssl -lcrypto -lresolv
 
 .PHONY: all clean
 all: $(TARGET)

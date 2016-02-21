@@ -31,9 +31,11 @@
 
 #include "buse.h"
 
+BIO* server_connection = 0;
+
 struct abad1dea_userdata {
     SSL_CTX* ssl_context;
-    int block_size;
+    uint64_t block_size;
     uint64_t block_count;
 
     char* user;
@@ -41,9 +43,9 @@ struct abad1dea_userdata {
     char* server;
 };
 
-static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* user, char* password, char* buffer, size_t size_in, size_t max_len) {
+static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* user, char* password, char* buffer, ssize_t size_in, ssize_t max_len) {
     size_t server_len = strlen(server);
-    
+
     char host[255];
     memset(host, 0, 255);
 
@@ -85,7 +87,7 @@ static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* use
                 continue;
             }
         }
-        
+
         if(inHost) {
             if(server[i] == '/') {
                 inURL = true;
@@ -100,7 +102,7 @@ static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* use
                 host[hostIndex++] = server[i];
             }
         }
-       
+
         if(inPort) {
             if(server[i] >= '0' && server[i] <= '9') {
                 port[portIndex++] = server[i];
@@ -124,20 +126,20 @@ static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* use
 
     char authorization_buffer[255];
     snprintf(authorization_buffer, 255, "%s:%s", user, password);
-    
+
     char authorization[300];
     memset(authorization, 0, 300);
     // hidden gem in resolv.h
     b64_ntop((u_char*)authorization_buffer, strlen(authorization_buffer), authorization, 299);
-    
+
     size_t initial_request_size = 1024;
     char* request = malloc(initial_request_size);
 
     char* format_string = "%s %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Authorization: Basic %s\r\n"
-        "Content-Length: %lu\r\n"
-        "Content-Type: application/octet-stream\r\n\r\n";
+                          "Host: %s\r\n"
+                          "Authorization: Basic %s\r\n"
+                          "Content-Length: %lu\r\n"
+                          "Content-Type: application/octet-stream\r\n\r\n";
 
     size_t actual_request_length = snprintf(request, initial_request_size, format_string, size_in ? "PUT" : "GET", url, host, authorization, size_in);
 
@@ -147,188 +149,215 @@ static void request_http(SSL_CTX* ctx, char* server, char* url_suffix, char* use
         snprintf(request, initial_request_size, format_string, size_in ? "PUT" : "GET", url, host, authorization, size_in);
     }
 
-    BIO* bio;
-    SSL* ssl;
+    bool retry_request = false;
 
-    if(https) {
-        bio = BIO_new_ssl_connect(ctx);
-        BIO_get_ssl(bio, &ssl);
+    do {
+        retry_request = false;
+        bool connection_reused = false;
 
-        if(!ssl) {
-            fprintf(stderr, "Can't establish ssl-conection!\n");
-            exit(-1);
+        if(server_connection) {
+            size_t alive = BIO_write(server_connection, request, strlen(request));
+
+            if(alive != strlen(request) || BIO_flush(server_connection) != 1) {
+                BIO_free_all(server_connection);
+                fprintf(stderr, "Connection is dead, create a new one (%lu != %lu)\n", alive, strlen(request));
+                server_connection = 0;
+            }
+            else {
+                connection_reused = true;
+            }
         }
 
-        SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
-    }
-    else {
-        bio = BIO_new(BIO_s_connect());
-    }
- 
-    BIO_set_conn_hostname(bio, host);
-    BIO_set_conn_port(bio, port);
-   
-    if(BIO_do_connect(bio) <= 0) {
-        fprintf(stderr, "Error connecting to server!\n");
-        ERR_print_errors_fp(stderr);
-        exit(-1);
-    }
+        if(!server_connection) {
+            fprintf(stderr, "Creating new connection ...");
+            SSL* ssl;
 
-    if(https) {
-        if(BIO_do_handshake(bio) <= 0) {
-            fprintf(stderr, "Error establishing SSL connection!\n");
-            ERR_print_errors_fp(stderr);
-            exit(-1);
-        }
-    }
+            if(https) {
+                server_connection = BIO_new_ssl_connect(ctx);
+                BIO_get_ssl(server_connection, &ssl);
 
-    BIO_write(bio, request, strlen(request));
+                if(!ssl) {
+                    fprintf(stderr, "Can't establish ssl-conection!\n");
+                    exit(-2);
+                }
 
-    if(size_in) {
-        BIO_write(bio, buffer, size_in);
-    }
+                SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+                fprintf(stderr, " SSL -> done\n");
+            }
+            else {
+                server_connection = BIO_new(BIO_s_connect());
+                fprintf(stderr, " PLAIN -> done\n");
+            }
 
-    memset(buffer, 0, max_len);
-    
-    size_t data_length = 0;
+            BIO_set_conn_hostname(server_connection, host);
+            BIO_set_conn_port(server_connection, port);
 
-    // read headers
-    char headerName[64];
-    memset(headerName, 0, 64);
-    char headerValue[192];
-    memset(headerValue, 0, 192);
+            if(BIO_do_connect(server_connection) <= 0) {
+                fprintf(stderr, "Error connecting to server!\n");
+                ERR_print_errors_fp(stderr);
+                exit(-3);
+            }
 
-    bool inName = false;
-    bool inValue = false;
-    bool skipSpaces = false;
-    bool lastWasLinebreak = false;
-    bool firstLine = true;
-    int headerNameIndex = 0;
-    int headerValueIndex = 0;
-
-    char httpBuffer[512];
-    memset(httpBuffer, 0, sizeof(httpBuffer));
-    int bytes_in_buffer = 0;
-
-    char* bufferPtr = httpBuffer;
-
-    for(;;) {
-        if(bytes_in_buffer == 0) {
-            memset(httpBuffer, 0, sizeof(httpBuffer));
-            bytes_in_buffer = BIO_read(bio, httpBuffer, sizeof(httpBuffer));
-            bufferPtr = httpBuffer;
+            if(https) {
+                if(BIO_do_handshake(server_connection) <= 0) {
+                    fprintf(stderr, "Error establishing SSL connection!\n");
+                    ERR_print_errors_fp(stderr);
+                    exit(-4);
+                }
+            }
         }
 
-        char c = *(bufferPtr++);
-        bytes_in_buffer--;
+        if(!connection_reused) {
+            if(BIO_write(server_connection, request, strlen(request)) != (int)strlen(request)) {
+                BIO_free_all(server_connection);
+                server_connection = 0;
+                retry_request = true;
+                continue;
+            }
+        }
 
-        if(skipSpaces && c == ' ') {
+        if(size_in) {
+            if(BIO_write(server_connection, buffer, size_in) != (int)size_in) {
+                BIO_free_all(server_connection);
+                server_connection = 0;
+                retry_request = true;
+                continue;
+            }
+        }
+
+        memset(buffer, 0, max_len);
+
+        ssize_t data_length = 0;
+
+        // read headers
+        char headerName[64];
+        memset(headerName, 0, 64);
+        char headerValue[192];
+        memset(headerValue, 0, 192);
+
+        bool inName = false;
+        bool inValue = false;
+        bool skipSpaces = false;
+        bool lastWasLinebreak = false;
+        bool firstLine = true;
+        int headerNameIndex = 0;
+        int headerValueIndex = 0;
+
+        const int httpBufferSize = 16384;
+        char httpBuffer[httpBufferSize];
+        memset(httpBuffer, 0, httpBufferSize);
+        long bytes_in_buffer = 0;
+        long buffer_index = 0;
+
+        for(;;) {
+            if(bytes_in_buffer == buffer_index) {
+                memset(httpBuffer, 0, httpBufferSize);
+                bytes_in_buffer = BIO_read(server_connection, httpBuffer, httpBufferSize);
+                buffer_index = 0;
+
+                if(bytes_in_buffer <= 0) {
+                    fprintf(stderr, "Connection died ...\n");
+                    BIO_free_all(server_connection);
+                    server_connection = 0;
+                    retry_request = true;
+                    break;
+                }
+            }
+
+            char c = httpBuffer[buffer_index++];
+
+            if(skipSpaces && c == ' ') {
+                continue;
+            }
+
+            if(lastWasLinebreak && c == '\r') {
+            }
+            else if(lastWasLinebreak && c == '\n') {
+                break;
+            }
+            else {
+                lastWasLinebreak = false;
+            }
+
+            if(firstLine) {
+                if(c == '\n') {
+                    firstLine = false;
+                    inName = true;
+                }
+            }
+
+            if(inName) {
+                if(c == ':') {
+                    inName = false;
+                    inValue = true;
+                    skipSpaces = true;
+                    continue;
+                }
+
+                headerName[headerNameIndex++] = tolower(c);
+            }
+
+            if(inValue) {
+                skipSpaces = false;
+
+                if(c == '\r') {
+                    continue;
+                }
+                else if(c == '\n') {
+                    inName = true;
+                    inValue = false;
+                    lastWasLinebreak = true;
+
+                    if(strcmp(headerName, "content-length") == 0) {
+                        data_length = atoi(headerValue);
+                    }
+
+                    memset(headerName, 0, sizeof(headerName));
+                    memset(headerValue, 0, sizeof(headerValue));
+
+                    headerNameIndex = 0;
+                    headerValueIndex = 0;
+                }
+                else {
+                    headerValue[headerValueIndex++] = c;
+                }
+            }
+        }
+
+        if(retry_request) {
             continue;
         }
 
-        if(lastWasLinebreak && c == '\r') {
-            bufferPtr++;
-            bytes_in_buffer--;
-            break;
-        }
+        for(ssize_t i = 0; i < data_length;) {
+            if(buffer_index == bytes_in_buffer) {
+                memset(httpBuffer, 0, httpBufferSize);
+                bytes_in_buffer = BIO_read(server_connection, httpBuffer, httpBufferSize);
+                buffer_index = 0;
 
-        lastWasLinebreak = false;
-
-        if(firstLine) {
-            if(c == '\n') {
-                firstLine = false;
-                inName = true;
-            }
-        }
-
-        if(inName) {
-            if(c == ':') {
-                inName = false;
-                inValue = true;
-                skipSpaces = true;
-                continue;
-            }
-
-            headerName[headerNameIndex++] = tolower(c);
-        }
-
-        if(inValue) {
-            skipSpaces = false;
-
-            if(c == '\r') {
-                continue;
-            }
-            else if(c == '\n') {
-                inName = true;
-                inValue = false;
-                lastWasLinebreak = true;
-
-                if(strcmp(headerName, "content-length") == 0) {
-                    data_length = atoi(headerValue);
+                if(bytes_in_buffer <= 0) {
+                    fprintf(stderr, "Connection died ...\n");
+                    BIO_free_all(server_connection);
+                    server_connection = 0;
+                    retry_request = true;
+                    break;
                 }
-    
-                memset(headerName, 0, sizeof(headerName));
-                memset(headerValue, 0, sizeof(headerValue));
+            }
 
-                headerNameIndex = 0;
-                headerValueIndex = 0;
-            }
-            else {
-                headerValue[headerValueIndex++] = c;
-            }
+            memcpy(buffer + i, httpBuffer + buffer_index, (bytes_in_buffer - buffer_index) > (max_len - i) ? (max_len - i) : (bytes_in_buffer - buffer_index));
+            buffer_index += bytes_in_buffer;
+            i += buffer_index;
         }
-    }
-
-    if(bytes_in_buffer > data_length) {
-        bytes_in_buffer = data_length;
-    }
-
-    memcpy(buffer, bufferPtr, bytes_in_buffer > max_len ? max_len : bytes_in_buffer);
-
-    if(data_length - bytes_in_buffer) {
-        BIO_read(bio, buffer + bytes_in_buffer, (data_length - bytes_in_buffer) > max_len ? max_len : (data_length - bytes_in_buffer));
-    }
-
-    BIO_free_all(bio);
+    } while(retry_request);
 }
 
 static int xmp_read(void *buf, u_int32_t len, u_int64_t offset, void *userdata_ptr)
 {
     struct abad1dea_userdata* userdata = (struct abad1dea_userdata*)userdata_ptr;
 
-    if(len % userdata->block_size != 0 || (len % userdata->block_size) != 0) {
-        exit(-1);
-    }
+    char suffix_buffer[32];
+    snprintf(suffix_buffer, 32, "bytes/%lu/%u", offset, len);
 
-    int numblocks   = len / userdata->block_size;
-    int start_block = offset / userdata->block_size;
-
-    char* buffer = mmap(NULL, numblocks * userdata->block_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-
-    for(int i = start_block; i < start_block + numblocks; i++) {
-        pid_t pid = fork();
-        
-        if(pid == 0) {
-            char suffix_buffer[32];
-            snprintf(suffix_buffer, 32, "%d", i);
-
-            request_http(userdata->ssl_context, userdata->server, suffix_buffer, userdata->user, userdata->password, buffer + ((i - start_block) * userdata->block_size), 0, userdata->block_size);
-
-            printf("Block %d read from server\n", i);
-            exit(0);
-        }
-    }
-
-    int status;
-    pid_t pid;
-    while(numblocks > 0) {
-        pid = wait(&status);
-        --numblocks;
-        printf("%d children left ...\n", numblocks);
-    }
-
-    memcpy(buf, buffer, len);
-    munmap(buffer, numblocks * userdata->block_size);
+    request_http(userdata->ssl_context, userdata->server, suffix_buffer, userdata->user, userdata->password, buf, 0, len);
     return 0;
 }
 
@@ -336,54 +365,30 @@ static int xmp_write(const void *buf, u_int32_t len, u_int64_t offset, void *use
 {
     struct abad1dea_userdata* userdata = (struct abad1dea_userdata*)userdata_ptr;
 
-    if(len % userdata->block_size != 0 || (len % userdata->block_size) != 0) {
-        exit(-1);
-    }
+    char suffix_buffer[32];
+    snprintf(suffix_buffer, 32, "bytes/%lu", offset);
 
-    int numblocks   = len / userdata->block_size;
-    int start_block = offset / userdata->block_size;
-    
-    for(int i = start_block; i < start_block + numblocks; i++) {
-        pid_t pid = fork();
-
-        if(pid == 0) {
-            char suffix_buffer[32];
-            snprintf(suffix_buffer, 32, "%d", i);
-
-            request_http(userdata->ssl_context, userdata->server, suffix_buffer, userdata->user, userdata->password, (char*)buf + ((i - start_block) * userdata->block_size), userdata->block_size, 0);
-
-            printf("Block %d written to server\n", i);
-            exit(0);
-        }
-    }
-
-    int status;
-    pid_t pid;
-    while(numblocks > 0) {
-        pid = wait(&status);
-        --numblocks;
-        printf("%d children left ...\n", numblocks);
-    }
-
+    request_http(userdata->ssl_context, userdata->server, suffix_buffer, userdata->user, userdata->password, (char*)buf, len, 0);
     return 0;
 }
 
 static struct buse_operations aop = {
-  .read = xmp_read,
-  .write = xmp_write,
-  .size = 128 * 1024 * 1024,
+    .read = xmp_read,
+    .write = xmp_write,
+    .size = 128 * 1024 * 1024,
+    .blksize = 4096,
 };
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
-        fprintf(stderr, 
-            "Usage:\n"
-            "  %s /dev/nbd0 https://api-dev.abad1dea.net:8080/block/ littlefox@abad1dea.net password\n"
-            "Don't forget to load nbd kernel module (`modprobe nbd`) and\n"
-            "run as root.\n", argv[0]);
+        fprintf(stderr,
+                "Usage:\n"
+                "  %s /dev/nbd0 https://api-dev.abad1dea.net:8443/ littlefox@abad1dea.net password\n"
+                "Don't forget to load nbd kernel module (`modprobe nbd`) and\n"
+                "run as root.\n", argv[0]);
         return 1;
     }
-   
+
     SSL_library_init();
     OpenSSL_add_all_algorithms();
 
@@ -394,16 +399,17 @@ int main(int argc, char *argv[]) {
     userdata.ssl_context = SSL_CTX_new(TLSv1_2_client_method());
 
     char buffer[32];
-    
-    request_http(userdata.ssl_context, userdata.server, "count", userdata.user, userdata.password, buffer, 0, sizeof(buffer));
+
+    request_http(userdata.ssl_context, userdata.server, "block/count", userdata.user, userdata.password, buffer, 0, sizeof(buffer));
     userdata.block_count = atoi(buffer);
 
-    request_http(userdata.ssl_context, userdata.server, "size", userdata.user, userdata.password, buffer, 0, sizeof(buffer));
+    request_http(userdata.ssl_context, userdata.server, "block/size", userdata.user, userdata.password, buffer, 0, sizeof(buffer));
     userdata.block_size = atoi(buffer);
 
-    printf("Number of blocks: %lu, size of block: %d\n", userdata.block_count, userdata.block_size);
+    printf("Number of blocks: %lu, size of block: %lu\n", userdata.block_count, userdata.block_size);
 
     aop.size = userdata.block_size * userdata.block_count;
+    aop.blksize = userdata.block_size;
 
     return buse_main(argv[1], &aop, (void*)&userdata);
 }

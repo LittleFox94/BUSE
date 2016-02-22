@@ -375,8 +375,6 @@ static int xmp_write(const void *buf, u_int32_t len, u_int64_t offset, void *use
 static struct buse_operations aop = {
     .read = xmp_read,
     .write = xmp_write,
-    .size = 128 * 1024 * 1024,
-    .blksize = 4096,
 };
 
 int main(int argc, char *argv[]) {
@@ -409,7 +407,6 @@ int main(int argc, char *argv[]) {
     printf("Number of blocks: %lu, size of block: %lu\n", userdata.block_count, userdata.block_size);
 
     aop.size = userdata.block_size * userdata.block_count;
-    aop.blksize = userdata.block_size;
 
     return buse_main(argv[1], &aop, (void*)&userdata);
 }
